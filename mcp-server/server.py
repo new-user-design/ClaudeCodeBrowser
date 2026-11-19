@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import hmac
 import secrets
 import stat
 import sys
@@ -51,7 +52,8 @@ import socket
 # Configure logging
 LOG_DIR = Path.home() / '.claudecodebrowser' / 'logs'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / 'mcp_server.log'
+_LOG_PORT = os.environ.get('CLAUDE_BROWSER_HTTP_PORT', '8765')
+LOG_FILE = LOG_DIR / ('mcp_server.log' if _LOG_PORT == '8765' else f'mcp_server_{_LOG_PORT}.log')
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -90,6 +92,11 @@ API_TOKEN = _load_or_create_api_token()
 HOST = os.environ.get('CLAUDE_BROWSER_HOST', '127.0.0.1')
 HTTP_PORT = int(os.environ.get('CLAUDE_BROWSER_HTTP_PORT', '8765'))
 WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
+# WebSocket transport is unused by the extensions; off unless explicitly enabled.
+WS_ENABLED = HAS_WEBSOCKETS and os.environ.get('CLAUDE_BROWSER_ENABLE_WS', '0') == '1'
+MAX_BODY_BYTES = 64 * 1024 * 1024  # screenshots are the largest payloads
+MAX_POLL_WAIT = 25.0  # seconds a long-poll may block
+QUIET_PATHS = {'/browser/poll', '/health'}
 
 # Screenshots directory - configurable via environment variable
 # Default to /tmp/claudecodebrowser/screenshots (accessible from any mount point)
@@ -706,15 +713,49 @@ class BrowserConnectionManager:
             event.set()
 
 
-# Global connection manager
+class CommandQueue:
+    """Commands waiting for the extension. Supports long-polling and removal of
+    commands whose caller already timed out, so stale actions never run late."""
+
+    def __init__(self):
+        self._items = []
+        self._cond = threading.Condition()
+
+    def put(self, command: Dict[str, Any]):
+        with self._cond:
+            self._items.append(command)
+            self._cond.notify_all()
+
+    def get(self, wait: float = 0.0):
+        with self._cond:
+            if not self._items and wait > 0:
+                self._cond.wait_for(lambda: bool(self._items), timeout=wait)
+            if self._items:
+                return self._items.pop(0), bool(self._items)
+            return None, False
+
+    def discard(self, request_id: str) -> bool:
+        with self._cond:
+            for i, c in enumerate(self._items):
+                if c.get('requestId') == request_id:
+                    del self._items[i]
+                    return True
+            return False
+
+
+# Global connection manager and HTTP command queue
 connection_manager = BrowserConnectionManager()
+command_queue = CommandQueue()
 
 
 class MCPHTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler for MCP server."""
 
     def log_message(self, format, *args):
-        logger.info(f"HTTP: {format % args}")
+        # Polls arrive several times a second; keep them out of the log unless debugging
+        path = urlparse(getattr(self, 'path', '') or '').path
+        level = logging.DEBUG if path in QUIET_PATHS else logging.INFO
+        logger.log(level, f"HTTP: {format % args}")
 
     def send_json_response(self, data: Dict[str, Any], status: int = 200):
         """Send a JSON response."""
@@ -727,7 +768,8 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def _check_auth(self) -> bool:
         """Validate the X-API-Key header against the server token."""
-        return self.headers.get('X-API-Key') == API_TOKEN
+        supplied = self.headers.get('X-API-Key') or ''
+        return hmac.compare_digest(supplied.encode(), API_TOKEN.encode())
 
     def do_OPTIONS(self):
         """Reject CORS preflight: no cross-origin access is needed or allowed."""
@@ -775,14 +817,15 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response({'screenshots': sorted(screenshots, key=lambda x: x['created'], reverse=True)})
 
         elif parsed.path == '/browser/poll':
-            # Extension/native host polls for pending commands
-            pending = getattr(self.server, '_pending_commands', [])
-            if pending:
-                # Return and clear the first pending command
-                command = pending.pop(0)
-                self.send_json_response({'command': command, 'has_more': len(pending) > 0})
-            else:
-                self.send_json_response({'command': None, 'has_more': False})
+            # Extension/native host polls for pending commands.
+            # ?wait=N long-polls up to N seconds (Safari bridge); no param = immediate (Firefox host).
+            try:
+                wait = float(parse_qs(parsed.query).get('wait', ['0'])[0])
+            except ValueError:
+                wait = 0.0
+            wait = max(0.0, min(wait, MAX_POLL_WAIT))
+            command, has_more = command_queue.get(wait)
+            self.send_json_response({'command': command, 'has_more': has_more})
 
         else:
             self.send_json_response({'error': 'Not found'}, 404)
@@ -794,7 +837,14 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
-        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            self.send_json_response({'error': 'Bad Content-Length'}, 400)
+            return
+        if content_length < 0 or content_length > MAX_BODY_BYTES:
+            self.send_json_response({'error': 'Request body too large'}, 413)
+            return
         body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else '{}'
 
         try:
@@ -948,7 +998,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         # No WebSocket connection — use HTTP polling with the native host.
         # ThreadingHTTPServer ensures /browser/poll and /browser/response are
         # served concurrently while this thread blocks waiting for the response.
-        request_id = str(time.time())
+        request_id = secrets.token_hex(8)
         command_data = {
             'action': action,
             'tabId': tab_id,
@@ -961,8 +1011,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         result_holder = {}
         connection_manager.http_pending_requests[request_id] = (event, result_holder)
 
-        self.server._pending_commands = getattr(self.server, '_pending_commands', [])
-        self.server._pending_commands.append(command_data)
+        command_queue.put(command_data)
 
         logger.info(f"Queued command {action} (requestId={request_id}), waiting for browser response...")
 
@@ -974,7 +1023,10 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             return response
         else:
             connection_manager.http_pending_requests.pop(request_id, None)
-            logger.warning(f"Command {action} timed out after 30s")
+            # Never let a timed-out command fire later when a browser reconnects
+            never_delivered = command_queue.discard(request_id)
+            logger.warning(f"Command {action} timed out after 30s"
+                           f"{' (no browser picked it up; discarded)' if never_delivered else ''}")
             return {
                 'success': False,
                 'error': f'Command {action} timed out waiting for browser response after 30s',
@@ -1033,13 +1085,26 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 def run_http_server():
     """Run the HTTP server."""
+    if HOST not in ('127.0.0.1', 'localhost', '::1'):
+        logger.warning(f"Binding to non-loopback host {HOST}: the API is then reachable from the network")
     server = ThreadingHTTPServer((HOST, HTTP_PORT), MCPHTTPHandler)
     logger.info(f"HTTP server starting on {HOST}:{HTTP_PORT}")
     server.serve_forever()
 
 
-async def websocket_handler(websocket, path):
-    """Handle WebSocket connections from browser extensions."""
+async def websocket_handler(websocket, path=None):
+    """Handle WebSocket connections. Requires ?token=<api token>; rejects web-page origins,
+    since any site can open a WebSocket to localhost."""
+    request = getattr(websocket, 'request', None)
+    req_path = path or getattr(request, 'path', '') or getattr(websocket, 'path', '') or ''
+    headers = getattr(request, 'headers', None) or getattr(websocket, 'request_headers', {}) or {}
+    origin = headers.get('Origin', '') if hasattr(headers, 'get') else ''
+    token = parse_qs(urlparse(req_path).query).get('token', [''])[0]
+    if (origin.startswith('http://') or origin.startswith('https://')
+            or not hmac.compare_digest(token.encode(), API_TOKEN.encode())):
+        logger.warning(f"Rejected WebSocket connection (origin={origin or 'none'})")
+        await websocket.close(code=1008, reason='Unauthorized')
+        return
     browser_id = f"browser_{id(websocket)}"
     connection_manager.register_browser(browser_id, websocket)
 
@@ -1067,8 +1132,9 @@ async def websocket_handler(websocket, path):
 
 async def run_websocket_server():
     """Run the WebSocket server."""
-    if not HAS_WEBSOCKETS:
-        logger.warning("websockets module not installed, WebSocket server disabled")
+    if not WS_ENABLED:
+        logger.info("WebSocket server disabled (set CLAUDE_BROWSER_ENABLE_WS=1 to enable)")
+        await asyncio.Event().wait()
         return
 
     server = await websockets.serve(websocket_handler, HOST, WS_PORT)
@@ -1082,7 +1148,7 @@ async def run_with_headless():
     headless = await init_headless_browser()
     logger.info("Headless browser ready")
 
-    if HAS_WEBSOCKETS:
+    if WS_ENABLED:
         await run_websocket_server()
     else:
         # No WebSocket but headless is running — just keep the event loop alive
@@ -1112,7 +1178,7 @@ def main():
 
     if HEADLESS_MODE:
         asyncio.run(run_with_headless())
-    elif HAS_WEBSOCKETS:
+    elif WS_ENABLED:
         asyncio.run(run_websocket_server())
     else:
         # If no websockets, just keep the HTTP server running
