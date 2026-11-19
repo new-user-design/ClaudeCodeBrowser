@@ -24,7 +24,8 @@ m.pop("browser_specific_settings", None)
 m["name"] = "ClaudeCodeBrowser"
 m["version"] = VERSION
 m["background"] = {"scripts": ["bridge.js", "background.js"], "persistent": True}
-perms = [p for p in m["permissions"] if p != "<all_urls>"]
+# Safari has no notifications API (background.js already guards its use)
+perms = [p for p in m["permissions"] if p not in ("<all_urls>", "notifications")]
 m["permissions"] = perms + ["<all_urls>", "http://127.0.0.1/*", "http://localhost/*"]
 (OUT / "manifest.json").write_text(json.dumps(m, indent=2) + "\n")
 

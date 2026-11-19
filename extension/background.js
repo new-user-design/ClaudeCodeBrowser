@@ -216,7 +216,7 @@ async function handleCommand(message) {
         result = await waitForElement(tabId, data);
         break;
       case "getTabs":
-        result = await getAllTabs();
+        result = await getAllTabs(data);
         break;
       case "createTab":
         result = await createNewTab(data);
@@ -248,6 +248,38 @@ async function handleCommand(message) {
         break;
       case "reloadByUrl":
         result = await reloadTabsByUrl(data);
+        break;
+      case "goBack":
+        result = await navigateHistory(tabId, "back");
+        break;
+      case "goForward":
+        result = await navigateHistory(tabId, "forward");
+        break;
+      case "requestApproval":
+        result = await requestApproval(tabId, data);
+        break;
+      case "solveCaptcha":
+        result = await solveCaptcha(tabId, data);
+        break;
+      // Element interaction and dynamic-content commands implemented by the
+      // content script — forwarded as-is
+      case "getValue":
+      case "setValue":
+      case "selectOption":
+      case "hover":
+      case "getAttribute":
+      case "focus":
+      case "getComputedStyles":
+      case "getBoundingRect":
+      case "waitForChange":
+      case "waitForNetworkIdle":
+      case "observeElement":
+      case "stopObserving":
+      case "scrollAndCapture":
+      case "clickAndWait":
+      case "pressKey":
+      case "getText":
+        result = await sendToContentScript(tabId, { action, ...data });
         break;
       // Console and network logging commands
       case "startLogging":
@@ -393,6 +425,62 @@ async function screenshotAllTabs(options = {}) {
       count: results.filter(r => r.success).length,
       failed: results.filter(r => !r.success).length
     };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Human approval: OS notification to catch the user's attention, plus an
+// in-page Approve/Deny banner (content script) that carries the decision
+async function requestApproval(tabId, data = {}) {
+  try {
+    if (browser.notifications) {
+      await browser.notifications.create({
+        type: "basic",
+        title: "Claude requests approval",
+        message: (data.message || "Claude wants to perform an action").slice(0, 200),
+        iconUrl: browser.runtime.getURL("icons/icon-48.png")
+      });
+    }
+  } catch (e) {
+    // Notifications unavailable — the in-page banner still works
+  }
+  return sendToContentScript(tabId, { action: "requestApproval", ...data });
+}
+
+// Captcha handoff: notify the human (unless it's a detect-only probe), then
+// let the content script show the solve banner and wait for completion
+async function solveCaptcha(tabId, data = {}) {
+  if (!data.detectOnly) {
+    try {
+      if (browser.notifications) {
+        await browser.notifications.create({
+          type: "basic",
+          title: "Captcha needs solving",
+          message: "Claude paused on a captcha and needs you to solve it.",
+          iconUrl: browser.runtime.getURL("icons/icon-48.png")
+        });
+      }
+    } catch (e) {
+      // Notifications unavailable — the in-page banner still works
+    }
+  }
+  return sendToContentScript(tabId, { action: "solveCaptcha", ...data });
+}
+
+// History navigation (Back/Forward buttons)
+async function navigateHistory(tabId, direction) {
+  try {
+    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    if (direction === "back") {
+      await browser.tabs.goBack(tab.id);
+    } else {
+      await browser.tabs.goForward(tab.id);
+    }
+    // Give the navigation a moment to commit before reporting the new URL
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const updated = await browser.tabs.get(tab.id);
+    return { success: true, url: updated.url, title: updated.title };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -568,37 +656,57 @@ async function waitForElement(tabId, data) {
 }
 
 // Tab management
-async function getAllTabs() {
+async function getAllTabs(options = {}) {
   try {
-    const tabs = await browser.tabs.query({});
+    // Default scope: the window Claude is actually driving, not every
+    // window/tab in the user's browser. With dozens of tabs open, querying
+    // {} and returning full metadata per tab blows past response size
+    // limits. Opt into the wider view explicitly when needed.
+    const currentWindowOnly = options.current_window_only !== false;
+    const includeFavicon = options.include_favicon === true;
+    const urlPattern = options.url_pattern ? new RegExp(options.url_pattern) : null;
+    const limit = Number.isInteger(options.limit) ? options.limit : 50;
+
+    const queryOpts = currentWindowOnly ? { currentWindow: true } : {};
+    let tabs = await browser.tabs.query(queryOpts);
     const windows = await browser.windows.getAll();
     const windowMap = new Map(windows.map(w => [w.id, w]));
 
+    const totalMatched = urlPattern ? tabs.filter(t => urlPattern.test(t.url)).length : tabs.length;
+    if (urlPattern) {
+      tabs = tabs.filter(t => urlPattern.test(t.url));
+    }
+
+    const truncated = tabs.length > limit;
+    const pageTabs = tabs.slice(0, limit);
+
     return {
       success: true,
-      tabs: tabs.map(t => {
+      tabs: pageTabs.map(t => {
         const win = windowMap.get(t.windowId);
-        return {
+        const base = {
           id: t.id,
           url: t.url,
           title: t.title,
           active: t.active,
           windowId: t.windowId,
-          index: t.index,
           pinned: t.pinned,
-          highlighted: t.highlighted,
           status: t.status,  // "loading" or "complete"
-          discarded: t.discarded,  // tab unloaded to save memory
-          incognito: t.incognito,
-          audible: t.audible,  // playing audio
-          mutedInfo: t.mutedInfo,
-          favIconUrl: t.favIconUrl,
-          windowFocused: win?.focused || false,
-          windowState: win?.state  // "normal", "minimized", "maximized", "fullscreen"
+          audible: t.audible  // playing audio
         };
+        if (includeFavicon) {
+          base.favIconUrl = t.favIconUrl;
+        }
+        if (!currentWindowOnly) {
+          base.windowFocused = win?.focused || false;
+        }
+        return base;
       }),
+      returnedTabs: pageTabs.length,
+      truncated,
+      scope: currentWindowOnly ? 'current_window' : 'all_windows',
       windowCount: windows.length,
-      totalTabs: tabs.length,
+      totalTabs: totalMatched,
       summary: {
         active: tabs.filter(t => t.active).length,
         loading: tabs.filter(t => t.status === 'loading').length,
@@ -855,11 +963,15 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-// Listen for external connections (from MCP server via HTTP)
+// Refuse external messages. Nothing legitimate uses this path — the MCP
+// server reaches the extension via native messaging and HTTP polling, never
+// runtime.sendMessage — and an open forward here would let any co-installed
+// extension run arbitrary commands (including executeScript on any tab),
+// bypassing the API token and the localhost boundary entirely.
 browser.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
-  handleCommand(message)
-    .then(sendResponse);
-  return true;
+  console.warn("[ClaudeCodeBrowser] Refused external message from", sender?.id);
+  sendResponse({ success: false, error: "External messages are not accepted" });
+  return false;
 });
 
 // Context menu for quick actions
